@@ -5,7 +5,8 @@ Este repositorio contiene la demo técnica y propuesta técnica para la implemen
 El flujo se divide en capas (Raw, Silver, Gold) y está diseñado para ejecutarse nativamente en **AWS Glue (Python Shell)** orquestado por **AWS Step Functions**, permitiendo al mismo tiempo una ejecución y validación 100% local mediante motores análiticos desacoplados **Polars**, **DuckDB** o herramientas internas de aws como **Athena**.
 
 ## Estructura del Proyecto
-
+```text
+.
 ├── analytics/
 │   └── queries.py                     # Script para validación analítica y consultas SQL sobre la capa Gold
 ├── data/
