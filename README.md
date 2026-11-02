@@ -1,4 +1,3 @@
-````markdown
 # CaféNorte Serverless Data Lake
 
 Este repositorio contiene la demo técnica y propuesta técnica para la implementación de un Data Lake Serverless en AWS para **CaféNorte**. La arquitectura automatiza la ingesta, limpieza, validación y agregación de datos (Ventas POS, E-commerce, Inventario y Tipos de Cambio) preparándolos para su consumo.
@@ -7,8 +6,6 @@ El flujo se divide en capas (Raw, Silver, Gold) y está diseñado para ejecutars
 
 ## Estructura del Proyecto
 
-```text
-.
 ├── analytics/
 │   └── queries.py                     # Script para validación analítica y consultas SQL sobre la capa Gold
 ├── data/
@@ -26,7 +23,7 @@ El flujo se divide en capas (Raw, Silver, Gold) y está diseñado para ejecutars
 ├── README.md                          # Este archivo
 └── requirements.txt                   # Dependencias del proyecto (Polars, Boto3, etc.)
 ```
-````
+
 
 ## Requisitos Previos
 
@@ -217,6 +214,4 @@ ORDER BY peor_margen_registrado ASC;
 `0 registros retornados.`
 _(Nota: La ejecución confirma que, dentro del historial procesado, no existen transacciones que hayan generado un margen bruto negativo para CaféNorte)._
 
-```
 
-```
