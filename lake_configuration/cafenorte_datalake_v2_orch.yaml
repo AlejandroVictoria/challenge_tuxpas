@@ -1,0 +1,635 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CafeNorte Data Lakehouse - Automated Single-Pass Deployment Stack
+  Crea bucket S3, scripts placeholder, Glue Jobs, Catalogo, Lake Formation,
+  Lambda de precondiciones, SNS de alertas, Step Function y EventBridge Schedule Rule.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cafenorte
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, stg, prd]
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: "(Opcional) Correo electronico para recibir alertas de fallas del pipeline"
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # =========================================================================
+  # 1. ALMACENAMIENTO: BUCKET PRINCIPAL Y RESULTADOS ATHENA
+  # =========================================================================
+  LakehouseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-lakehouse-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResultsAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # =========================================================================
+  # 2. CATÁLOGO DE METADATOS Y ROL DE GLUE (CON LOGS DE PYTHON SHELL)
+  # =========================================================================
+  LakehouseDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_lakehouse_db"
+        Description: "Catalogo de metadatos unificado para CafeNorte"
+
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-execution-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [glue.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        # Permisos S3 requeridos por Parquet / Arrow / Polars
+        - PolicyName: S3SingleBucketLakehousePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt LakehouseBucket.Arn
+                  - !Sub "${LakehouseBucket.Arn}/*"
+
+        # Trazabilidad completa: salida y errores de Glue Python Shell (stdout y stderr)
+        - PolicyName: GluePythonShellLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:log-group:/aws-glue/python-jobs/*"
+
+  # =========================================================================
+  # 3. GOBERNANZA: LAKE FORMATION
+  # =========================================================================
+  LakeFormationSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !GetAtt GlueExecutionRole.Arn
+
+  LakehouseResourceRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !GetAtt LakehouseBucket.Arn
+      UseServiceLinkedRole: true
+
+  # =========================================================================
+  # 4. CUSTOM RESOURCE: CREACIÓN AUTOMÁTICA DE SCRIPTS PLACEHOLDER
+  # =========================================================================
+  ScriptInitializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PutInitScriptsToS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${LakehouseBucket.Arn}/scripts/*"
+
+  ScriptInitializerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-init-scripts-${Environment}"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt ScriptInitializerRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              if event['RequestType'] in ['Create', 'Update']:
+                  bucket = event['ResourceProperties']['BucketName']
+                  scripts = ['scripts/raw_to_silver.py', 'scripts/silver_to_gold.py']
+                  content = b"# Placeholder script. To be overwritten by pipeline deployment.\nprint('Init')\n"
+                  try:
+                      for script in scripts:
+                          s3.put_object(Bucket=bucket, Key=script, Body=content)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  except Exception as e:
+                      print(f"Error creating scripts: {e}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  InitializeGlueScripts:
+    Type: Custom::S3InitScripts
+    DependsOn: LakehouseBucket
+    Properties:
+      ServiceToken: !GetAtt ScriptInitializerLambda.Arn
+      BucketName: !Ref LakehouseBucket
+
+  # =========================================================================
+  # 5. CÓMPUTO: GLUE JOBS
+  # =========================================================================
+  RawToSilverGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: InitializeGlueScripts
+    Properties:
+      Name: !Sub "${ProjectName}-raw-to-silver"
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${LakehouseBucket}/scripts/raw_to_silver.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--additional-python-modules": "polars,pyarrow,s3fs"
+        "--LAKEHOUSE_BUCKET": !Ref LakehouseBucket
+        "--RAW_PREFIX": "raw/"
+        "--SILVER_PREFIX": "silver/"
+      MaxCapacity: 0.0625
+      Timeout: 15
+      GlueVersion: "3.0"
+
+  SilverToGoldGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: InitializeGlueScripts
+    Properties:
+      Name: !Sub "${ProjectName}-silver-to-gold"
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${LakehouseBucket}/scripts/silver_to_gold.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--additional-python-modules": "polars,pyarrow,s3fs"
+        "--LAKEHOUSE_BUCKET": !Ref LakehouseBucket
+        "--SILVER_PREFIX": "silver/"
+        "--GOLD_PREFIX": "gold/"
+      MaxCapacity: 0.0625
+      Timeout: 15
+      GlueVersion: "3.0"
+
+  # =========================================================================
+  # 6. CAPA ANALÍTICA: ATHENA WORKGROUP
+  # =========================================================================
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-analytics-workgroup"
+      Description: "Workgroup dedicado para control de cuotas y consultas analiticas"
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/query-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  # =========================================================================
+  # 7. ALERTAMIENTO: AMAZON SNS TOPIC
+  # =========================================================================
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-pipeline-alerts-${Environment}"
+      DisplayName: "Alertas Pipeline Lakehouse CafeNorte"
+
+  PipelineAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref PipelineAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # 8. PRECONDICIONES: LAMBDA VALIDACIÓN DE DATOS CRUDOS POR FECHA
+  # =========================================================================
+  ValidateRawDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ValidateRawS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt LakehouseBucket.Arn
+
+  ValidateRawDataLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-validate-raw-data-${Environment}"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt ValidateRawDataRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref LakehouseBucket
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from datetime import datetime, timezone
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              bucket = os.environ.get('BUCKET_NAME')
+              
+              # 1. Resolver fecha operativa: viene del evento o toma la fecha UTC actual
+              target_date = event.get('target_date')
+              if not target_date:
+                  target_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              
+              retry_count = event.get('retry_count', 0)
+
+              # 2. Si es carga base legacy sin subcarpetas dt=, o si usa partición explícita
+              # Estructura uniforme esperada: raw/<origen>/dt=<target_date>/
+              sources = {
+                  "pos": f"raw/pos/dt={target_date}/",
+                  "shopify": f"raw/shopify/dt={target_date}/",
+                  "inventory": f"raw/inventory/dt={target_date}/"
+              }
+
+              missing = []
+              for source_name, prefix in sources.items():
+                  resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+                  
+                  # Debe existir al menos un archivo dentro del prefijo exacto de la fecha operativa
+                  if resp.get('KeyCount', 0) == 0:
+                      # Soporte opcional: si target_date es "previous" y los archivos estaban planos en raw/<fuente>/archivo
+                      if target_date == "previous":
+                          base_resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"raw/{source_name}/", Delimiter="/", MaxKeys=1)
+                          # Verifica si hay archivos directos en la raíz del prefijo
+                          has_root_files = len(base_resp.get('Contents', [])) > 0
+                          if not has_root_files:
+                              missing.append(source_name)
+                      else:
+                          missing.append(source_name)
+
+              all_present = (len(missing) == 0)
+              
+              return {
+                  "all_files_present": all_present,
+                  "target_date": target_date,
+                  "missing_sources": missing,
+                  "retry_count": retry_count
+              }
+
+  # =========================================================================
+  # 9. ORQUESTACIÓN: STEP FUNCTIONS STATE MACHINE Y ROLES
+  # =========================================================================
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-stepfunctions-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [states.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Policies:
+        # Invocacion de la Lambda de validacion
+        - PolicyName: InvokeValidationLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ValidateRawDataLambda.Arn
+
+        # Control sincrono de los Glue Jobs (.sync)
+        - PolicyName: ExecuteGlueJobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-raw-to-silver"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-silver-to-gold"
+
+        # Notificaciones en caso de falla o ausencia de archivos
+        - PolicyName: PublishToSNSAlerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineAlertsTopic
+
+        # Trazabilidad y logs de la maquina de estados
+        - PolicyName: CloudWatchLogsDelivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ProjectName}-orchestrator-${Environment}"
+      RetentionInDays: 14
+
+  LakehouseOrchestratorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - RawToSilverGlueJob
+      - SilverToGoldGlueJob
+      - ValidateRawDataLambda
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-lakehouse-orchestrator-${Environment}"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Orquestacion Lakehouse CafeNorte: Validacion Raw -> Silver -> Gold con alertas y esperas",
+          "StartAt": "ValidateRawFiles",
+          "States": {
+            "ValidateRawFiles": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "OutputPath": "$.Payload",
+              "Parameters": {
+                "FunctionName": "${ValidateRawDataLambda.Arn}",
+                "Payload.$": "$"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "CheckRawDataCondition"
+            },
+            "CheckRawDataCondition": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.all_files_present",
+                  "BooleanEquals": true,
+                  "Next": "ExecuteRawToSilver"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.all_files_present",
+                      "BooleanEquals": false
+                    },
+                    {
+                      "Variable": "$.retry_count",
+                      "NumericLessThan": 2
+                    }
+                  ],
+                  "Next": "IncrementRetryAndWait"
+                }
+              ],
+              "Default": "NotifyMissingFilesAndFail"
+            },
+            "IncrementRetryAndWait": {
+              "Type": "Pass",
+              "Parameters": {
+                "target_date.$": "$.target_date",
+                "retry_count.$": "States.MathAdd($.retry_count, 1)"
+              },
+              "Next": "WaitForRawData"
+            },
+            "WaitForRawData": {
+              "Type": "Wait",
+              "Seconds": 900,
+              "Next": "ValidateRawFiles"
+            },
+            "NotifyMissingFilesAndFail": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertsTopic}",
+                "Subject": "ALERTA: Archivos raw incompletos en CafeNorte Lakehouse",
+                "Message.$": "States.Format('No se encontraron los datos requeridos para la fecha {}. Fuentes faltantes: {}', $.target_date, $.missing_sources)"
+              },
+              "Next": "FailMissingRawData"
+            },
+            "FailMissingRawData": {
+              "Type": "Fail",
+              "Error": "MissingRawDataError",
+              "Cause": "Los archivos requeridos en raw no estuvieron disponibles tras los reintentos."
+            },
+            "ExecuteRawToSilver": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${ProjectName}-raw-to-silver",
+                "Arguments": {
+                  "--TARGET_DATE.$": "$.target_date"
+                }
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "NotifyRawToSilverFailure"
+                }
+              ],
+              "Next": "ExecuteSilverToGold"
+            },
+            "NotifyRawToSilverFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertsTopic}",
+                "Subject": "FALLO: Job cafenorte-raw-to-silver fallo",
+                "Message.$": "States.Format('El Job raw-to-silver fallo en su ejecucion. Detalle: {}', $.errorInfo)"
+              },
+              "Next": "FailRawToSilver"
+            },
+            "FailRawToSilver": {
+              "Type": "Fail",
+              "Error": "RawToSilverJobFailed",
+              "Cause": "Fallo la ejecucion del Job raw-to-silver en AWS Glue."
+            },
+            "ExecuteSilverToGold": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${ProjectName}-silver-to-gold",
+                "Arguments": {
+                  "--TARGET_DATE.$": "$.target_date"
+                }
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "NotifySilverToGoldFailure"
+                }
+              ],
+              "Next": "PipelineSuccess"
+            },
+            "NotifySilverToGoldFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${PipelineAlertsTopic}",
+                "Subject": "FALLO: Job cafenorte-silver-to-gold fallo",
+                "Message.$": "States.Format('El Job silver-to-gold fallo en su ejecucion. Detalle: {}', $.errorInfo)"
+              },
+              "Next": "FailSilverToGold"
+            },
+            "FailSilverToGold": {
+              "Type": "Fail",
+              "Error": "SilverToGoldJobFailed",
+              "Cause": "Fallo la ejecucion del Job silver-to-gold en AWS Glue."
+            },
+            "PipelineSuccess": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+  # =========================================================================
+  # 10. DISPARADOR PROGRAMADO: EVENTBRIDGE SCHEDULE RULE (23:00 UTC)
+  # =========================================================================
+  EventBridgeToStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Policies:
+        - PolicyName: StartStateMachineExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref LakehouseOrchestratorStateMachine
+
+  EndOfDayScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-end-of-day-schedule-${Environment}"
+      Description: "Disparo diario a las 23:00 UTC para el pipeline Lakehouse"
+      ScheduleExpression: "cron(0 23 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref LakehouseOrchestratorStateMachine
+          Id: "StartLakehouseStepFunction"
+          RoleArn: !GetAtt EventBridgeToStepFunctionsRole.Arn
+          Input: '{"retry_count": 0}'
+
+Outputs:
+  LakehouseBucketName:
+    Value: !Ref LakehouseBucket
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
+  StateMachineArn:
+    Description: "ARN de la Step Function para ejecuciones manuales de demo"
+    Value: !Ref LakehouseOrchestratorStateMachine
+  AlertsTopicArn:
+    Description: "ARN del topico SNS para suscripciones a alertas"
+    Value: !Ref PipelineAlertsTopic

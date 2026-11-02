@@ -10,12 +10,18 @@ import polars as pl
 # =============================================================================
 # LOGGING ESTRUCTURADO
 # =============================================================================
+# Configurar el formato y forzar el stream hacia stdout
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,  # Limpia cualquier handler previo que AWS Glue o librerías hayan atado
 )
-logger = logging.getLogger("SilverToGoldPipeline")
+
+# Asegurar que el logger del módulo opere en INFO
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 # =============================================================================
@@ -99,23 +105,26 @@ class SilverDataReader:
     """
     Abstrae la lectura y escaneo de tablas Parquet desde S3 o almacenamiento local.
     """
-    def __init__(self, silver_base_uri: str):
+    def __init__(self, silver_base_uri: str, target_date: str):
         self.silver_base = silver_base_uri.rstrip("/")
+        self.target_date = target_date
 
     def read_table(self, table_name: str) -> pl.DataFrame:
+        print(f"[DEBUG] Leyendo tabla Silver: {table_name} desde {self.silver_base} para fecha objetivo: {self.target_date}")
+
         target_path = f"{self.silver_base}/{table_name}"
         logger.info(f"Cargando tabla Silver: {table_name}")
         
         # Lectura transparente usando wildcard recursivo para soportar carpetas particionadas o archivos directos
         try:
             if target_path.startswith("s3://"):
-                df = pl.read_parquet(f"{target_path}/**/*.parquet")
+                df = pl.read_parquet(f"{target_path}/dt={self.target_date}/*.parquet")    # <- Deuda técnica: tablas dim no son indexadas por fecha, pero fct si.
             else:
                 p = Path(target_path)
                 parquet_files = list(p.rglob("*.parquet"))
                 if not parquet_files:
                     raise FileNotFoundError(f"No se encontraron archivos .parquet en {target_path}")
-                df = pl.read_parquet(f"{target_path}/**/*.parquet")
+                df = pl.read_parquet(target_path)
             
             logger.info(f"  └─ {table_name}: {df.height:,} filas cargadas.")
             return df
@@ -409,13 +418,14 @@ class SilverToGoldPipeline:
     """
     Orquestador principal del ciclo de vida del pipeline Silver -> Gold.
     """
-    def __init__(self, silver_base_uri: str, gold_base_uri: str, glue_db: Optional[str] = None):
+    def __init__(self, silver_base_uri: str, gold_base_uri: str, target_date: str, glue_db: Optional[str] = None):
         self.silver_base = silver_base_uri
         self.gold_base = gold_base_uri
         self.glue_db = glue_db
-        
+        self.target_date = target_date
+
         self.connectivity = LakeConnectivityManager(silver_base_uri, gold_base_uri, glue_db)
-        self.reader = SilverDataReader(silver_base_uri)
+        self.reader = SilverDataReader(silver_base_uri, self.target_date)
         self.validator = SilverDataValidator()
         self.writer = GoldTableManager(gold_base_uri)
 
@@ -495,8 +505,12 @@ def main():
     parser.add_argument("--GLUE_DATABASE", type=str, default="cafenorte_lakehouse_db", help="Base de datos Glue")
     parser.add_argument("--LOCAL_SILVER_PATH", type=str, default=None, help="Ruta local Silver")
     parser.add_argument("--LOCAL_GOLD_PATH", type=str, default=None, help="Ruta local Gold")
+    parser.add_argument("--TARGET_DATE", type=str, required=True, help="Fecha objetivo (YYYY-MM-DD) para particionar los datos")
 
     args, unknown = parser.parse_known_args()
+
+    # Extrae la fecha objetivo para particionar los datos
+    target_date = args.TARGET_DATE
 
     # Selección dinámica de entorno local vs AWS S3
     if args.LOCAL_SILVER_PATH and args.LOCAL_GOLD_PATH:
@@ -517,6 +531,7 @@ def main():
         silver_base_uri=silver_uri,
         gold_base_uri=gold_uri,
         glue_db=glue_db,
+        target_date=target_date
     )
     pipeline.run()
 

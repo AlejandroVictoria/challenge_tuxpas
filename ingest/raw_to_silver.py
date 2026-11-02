@@ -14,13 +14,18 @@ for stream_name in ("stdout", "stderr"):
     if callable(reconfig):
         reconfig(encoding="utf-8", line_buffering=True)
 
-# Configuración de Logging estructurado
+# Configurar el formato y forzar el stream hacia stdout
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,  # Limpia cualquier handler previo que AWS Glue o librerías hayan atado
 )
-logger = logging.getLogger("RawToSilverETL")
+
+# Asegurar que el logger del módulo opere en INFO
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 # =============================================================================
@@ -440,9 +445,10 @@ class RawToSilverPipeline:
     """
     Coordina la ejecución de extremo a extremo: lectura -> transformación -> tipado -> escritura.
     """
-    def __init__(self, raw_base_uri: str, silver_base_uri: str):
+    def __init__(self, raw_base_uri: str, silver_base_uri: str, target_date: str):
         self.raw_base = raw_base_uri.rstrip("/")
         self.silver_base = silver_base_uri.rstrip("/")
+        self.target_date = target_date
         self.reader = S3LocalReader()
         print(f"[DEBUG] Raw base URI: {self.raw_base}, Silver base URI: {self.silver_base}")
         self.writer = ParquetDataWriter(self.silver_base)
@@ -452,22 +458,22 @@ class RawToSilverPipeline:
         execution_tasks = [
             {
                 "name": "POS Sales",
-                "uri": f"{self.raw_base}/pos/sales.csv",
+                "uri": f"{self.raw_base}/pos/dt={self.target_date}/sales.csv",
                 "processor": POSSalesProcessor(),
             },
             {
                 "name": "Ecommerce Orders",
-                "uri": f"{self.raw_base}/shopify/ecommerce_orders.parquet",
+                "uri": f"{self.raw_base}/shopify/dt={self.target_date}/ecommerce_orders.parquet",
                 "processor": EcommerceOrdersProcessor(),
             },
             {
                 "name": "Exchange Rates",
-                "uri": f"{self.raw_base}/fx/exchange_rates.csv",
+                "uri": f"{self.raw_base}/exchange_rates/exchange_rates.csv",
                 "processor": ExchangeRatesProcessor(),
             },
             {
                 "name": "Inventory Monolith",
-                "uri": f"{self.raw_base}/inventory/inventory.json",
+                "uri": f"{self.raw_base}/inventory/dt={self.target_date}/inventory.json",
                 "processor": InventoryJSONProcessor(),
             },
         ]
@@ -506,10 +512,14 @@ def main():
     parser.add_argument("--SILVER_PREFIX", type=str, default="silver/", help="Prefijo destino Silver")
     parser.add_argument("--LOCAL_RAW_PATH", type=str, default=None, help="Ruta local Raw (opcional)")
     parser.add_argument("--LOCAL_SILVER_PATH", type=str, default=None, help="Ruta local Silver (opcional)")
+    parser.add_argument("--TARGET_DATE", type=str, required=True, help="Fecha objetivo (YYYY-MM-DD) para particionar los datos")
 
     # Captura argumentos estándar de AWS Glue (los cuales vienen precedidos por --)
     args, unknown = parser.parse_known_args()
-
+    
+    # Extrae la fecha objetivo para particionar los datos
+    target_date = args.TARGET_DATE
+    
     # Si se pasan rutas locales, corre en modo local para pruebas inmediatas
     if args.LOCAL_RAW_PATH and args.LOCAL_SILVER_PATH:
         raw_uri = args.LOCAL_RAW_PATH
@@ -523,7 +533,7 @@ def main():
         silver_uri = "data/silver"
 
     print(f"[DEBUG] Raw URI: {raw_uri}, Silver URI: {silver_uri}")
-    pipeline = RawToSilverPipeline(raw_base_uri=raw_uri, silver_base_uri=silver_uri)
+    pipeline = RawToSilverPipeline(raw_base_uri=raw_uri, silver_base_uri=silver_uri, target_date=target_date)
     pipeline.run()
 
 

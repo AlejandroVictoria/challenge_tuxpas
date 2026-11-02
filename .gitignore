@@ -16,7 +16,6 @@ data/silver/*
 !data/silver/.gitkeep
 data/gold/*
 !data/gold/.gitkeep
-data/datos/*
 
 # Bases de datos efímeras DuckDB / SQLite
 *.duckdb
@@ -32,3 +31,4 @@ data/datos/*
 # test files
 test.py
 validating_tables.py
+generate_data.py
