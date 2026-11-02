@@ -118,7 +118,11 @@ class SilverDataReader:
         # Lectura transparente usando wildcard recursivo para soportar carpetas particionadas o archivos directos
         try:
             if target_path.startswith("s3://"):
-                df = pl.read_parquet(f"{target_path}/dt={self.target_date}/*.parquet")    # <- Deuda técnica: tablas dim no son indexadas por fecha, pero fct si.
+                if "previous" in self.target_date:
+                    target_path = f"{target_path}/**/*.parquet"
+                else:
+                    target_path = f"{target_path}/dt={self.target_date}/*.parquet"
+                df = pl.read_parquet(target_path)    # <- Deuda técnica: tablas dim no son indexadas por fecha, pero fct si.
             else:
                 p = Path(target_path)
                 parquet_files = list(p.rglob("*.parquet"))

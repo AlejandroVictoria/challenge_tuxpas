@@ -530,6 +530,7 @@ Resources:
                   "Next": "NotifyRawToSilverFailure"
                 }
               ],
+              "ResultPath": "$.raw_to_silver_result",
               "Next": "ExecuteSilverToGold"
             },
             "NotifyRawToSilverFailure": {
@@ -563,6 +564,7 @@ Resources:
                   "Next": "NotifySilverToGoldFailure"
                 }
               ],
+              "ResultPath": "$.silver_to_gold_result",
               "Next": "PipelineSuccess"
             },
             "NotifySilverToGoldFailure": {
