@@ -1,4 +1,34 @@
-./env
-/data
-/requerimentos
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+
+# Datos locales / Data Lake local
+data/raw/*
+!data/raw/.gitkeep
+data/silver/*
+!data/silver/.gitkeep
+data/gold/*
+!data/gold/.gitkeep
+data/datos/*
+
+# Bases de datos efímeras DuckDB / SQLite
+*.duckdb
+*.db
+*.sqlite
+
+# Logs y credenciales
+*.log
+.env
+.aws/
+.DS_Store
+
+# test files
+test.py
+validating_tables.py

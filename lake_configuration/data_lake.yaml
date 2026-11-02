@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CafeNorte Data Lakehouse - Automated Single-Pass Deployment Stack
+  Crea bucket S3, inicializa scripts placeholder con Custom Resource,
+  y aprovisiona Glue Jobs, Catalog y Lake Formation sin intervenciones manuales.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cafenorte
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, stg, prd]
+
+Resources:
+  # =========================================================================
+  # 1. ALMACENAMIENTO: BUCKET PRINCIPAL Y RESULTADOS ATHENA
+  # =========================================================================
+  LakehouseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-lakehouse-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResultsAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # =========================================================================
+  # 2. CATÁLOGO DE METADATOS Y ROLES
+  # =========================================================================
+  LakehouseDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${ProjectName}_lakehouse_db"
+        Description: "Catalogo de metadatos unificado para CafeNorte"
+
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-execution-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [glue.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3SingleBucketLakehousePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt LakehouseBucket.Arn
+                  - !Sub "${LakehouseBucket.Arn}/*"
+
+  # =========================================================================
+  # 3. GOBERNANZA: LAKE FORMATION
+  # =========================================================================
+  LakeFormationSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !GetAtt GlueExecutionRole.Arn
+
+  LakehouseResourceRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn: !GetAtt LakehouseBucket.Arn
+      UseServiceLinkedRole: true
+
+  # =========================================================================
+  # 4. CUSTOM RESOURCE: CREACIÓN AUTOMÁTICA DE SCRIPTS PLACEHOLDER
+  # =========================================================================
+  ScriptInitializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PutInitScriptsToS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${LakehouseBucket.Arn}/scripts/*"
+
+  ScriptInitializerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-init-scripts-${Environment}"
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt ScriptInitializerRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              if event['RequestType'] in ['Create', 'Update']:
+                  bucket = event['ResourceProperties']['BucketName']
+                  scripts = ['scripts/raw_to_silver.py', 'scripts/silver_to_gold.py']
+                  content = b"# Placeholder script. To be overwritten by pipeline deployment.\nprint('Init')\n"
+                  try:
+                      for script in scripts:
+                          s3.put_object(Bucket=bucket, Key=script, Body=content)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  except Exception as e:
+                      print(f"Error creating scripts: {e}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # Invocación del recurso personalizado (espera al bucket)
+  InitializeGlueScripts:
+    Type: Custom::S3InitScripts
+    DependsOn: LakehouseBucket
+    Properties:
+      ServiceToken: !GetAtt ScriptInitializerLambda.Arn
+      BucketName: !Ref LakehouseBucket
+
+  # =========================================================================
+  # 5. CÓMPUTO: GLUE JOBS (Dependen de que existan los scripts en S3)
+  # =========================================================================
+  RawToSilverGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: InitializeGlueScripts
+    Properties:
+      Name: !Sub "${ProjectName}-raw-to-silver"
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${LakehouseBucket}/scripts/raw_to_silver.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--additional-python-modules": "polars,pyarrow,s3fs"
+        "--LAKEHOUSE_BUCKET": !Ref LakehouseBucket
+        "--RAW_PREFIX": "raw/"
+        "--SILVER_PREFIX": "silver/"
+      MaxCapacity: 0.0625
+      Timeout: 15
+      GlueVersion: "3.0"
+
+  SilverToGoldGlueJob:
+    Type: AWS::Glue::Job
+    DependsOn: InitializeGlueScripts
+    Properties:
+      Name: !Sub "${ProjectName}-silver-to-gold"
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${LakehouseBucket}/scripts/silver_to_gold.py"
+      DefaultArguments:
+        "--job-language": "python"
+        "--additional-python-modules": "polars,pyarrow,s3fs"
+        "--LAKEHOUSE_BUCKET": !Ref LakehouseBucket
+        "--SILVER_PREFIX": "silver/"
+        "--GOLD_PREFIX": "gold/"
+      MaxCapacity: 0.0625
+      Timeout: 15
+      GlueVersion: "3.0"
+
+  # =========================================================================
+  # 6. CAPA ANALÍTICA: ATHENA WORKGROUP
+  # =========================================================================
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-analytics-workgroup"
+      Description: "Workgroup dedicado para control de cuotas y consultas analiticas"
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/query-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+Outputs:
+  LakehouseBucketName:
+    Value: !Ref LakehouseBucket
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
